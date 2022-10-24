@@ -1,0 +1,6 @@
+[submodule "vendor/PlatformDetection"]
+	path = vendor/PlatformDetection
+	url = https://github.com/onthegrid007/PlatformDetection
+[submodule "vendor/STDExtras"]
+	path = vendor/STDExtras
+	url = https://github.com/onthegrid007/STDExtras
