@@ -7,3 +7,9 @@
 [submodule "vendor/FileUtilities"]
 	path = vendor/FileUtilities
 	url = https://github.com/onthegrid007/FileUtilities
+[submodule "vendor/libelf"]
+	path = vendor/libelf
+	url = https://github.com/0intro/libelf.git
+[submodule "vendor/libelfmaster"]
+	path = vendor/libelfmaster
+	url = https://github.com/elfmaster/libelfmaster.git
