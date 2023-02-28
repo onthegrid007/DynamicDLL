@@ -1,10 +1,10 @@
 #ifndef DYNAMIC_DLL_
 #define DYNAMIC_DLL_
 
-#include "vendor/FileUtilities/vendor/PlatformDetection/PlatformDetection.h"
-#include "vendor/FileUtilities/vendor/STDExtras/vendor/Singleton/singleton_container_map.hpp"
+#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/PlatformDetection/PlatformDetection.h"
+#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/vendor/Singleton/singleton_container_map.hpp"
 #include "vendor/FileUtilities/FileUtilities.hpp"
-#include "vendor/FileUtilities/vendor/STDExtras/Semaphore/semaphore.h"
+#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/semaphore.h"
 #include "vendor/FileUtilities/vendor/STDExtras/STDExtras.hpp"
 extern "C" {
     #include "vendor/libelfmaster/include/libelfmaster.h"
@@ -26,7 +26,6 @@ extern "C" {
     #define OPEN_LIB_BY_CSTR(str) LoadLibraryA(str)
     #define GET_SYM_BY_STR(handle, str) GetProcAddress(handle, str)
     #define CLOSE_LIB_BY_HANDLE(handle) FreeLibrary(handle);
-    
 #else
     #include <link.h>
     #define DD_EXPORT __attribute__((visibility("default")))
@@ -154,7 +153,7 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
     
     template<typename T>
     DD_EXPORT T& GetSymAs(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
-        return *(T*)GetSymAddress(symname, needsDemangle, cmpAsMangled);
+        return *((T*)GetSymAddress(symname, needsDemangle, cmpAsMangled));
     }
     
     private:
