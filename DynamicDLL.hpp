@@ -2,10 +2,11 @@
 #define DYNAMIC_DLL_
 
 #include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/PlatformDetection/PlatformDetection.h"
-#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/vendor/Singleton/singleton_container_map.hpp"
-#include "vendor/FileUtilities/FileUtilities.hpp"
+#include <vector>
+#include <thread>
 #include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/semaphore.h"
-#include "vendor/FileUtilities/vendor/STDExtras/STDExtras.hpp"
+#include "vendor/FileUtilities/FileUtilities.hpp"
+#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/vendor/Singleton/singleton_container_map.hpp"
 extern "C" {
     #include "vendor/libelfmaster/include/libelfmaster.h"
 }
@@ -30,13 +31,32 @@ extern "C" {
     #include <link.h>
     #define DD_EXPORT __attribute__((visibility("default")))
     typedef void* DLLModule;
-    #define OPEN_LIB_INIT_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | ((BIT_CHECK(m_flags, ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_GLOBAL : RTLD_GLOBAL)))
-    #define OPEN_LIB_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | ((BIT_CHECK(m_flags, ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_LOCAL : RTLD_LOCAL)))
+    #define OPEN_LIB_INIT_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_GLOBAL : RTLD_GLOBAL)))
+    #define OPEN_LIB_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_LOCAL : RTLD_LOCAL)))
     // #define OPEN_LIB_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL)
     // #define OPEN_LIB_COLD_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_GLOBAL)
     #define GET_SYM_BY_STR(handle, str) dlsym(handle, str)
     #define CLOSE_LIB_BY_HANDLE(handle) dlclose(handle)
 #endif
+
+inline const uint64_t getEditDistance(const std::string& x, const std::string& y) {
+    const uint64_t m = x.length();
+    const uint64_t n = y.length();
+    uint64_t T[m + 1][n + 1];
+    for(uint64_t i = 1; i <= m; i++)
+        T[i][0] = i;
+    for(uint64_t j = 1; j <= n; j++)
+        T[0][j] = j;
+    for(uint64_t i = 1; i <= m; i++)
+        for (uint64_t j = 1; j <= n; j++)
+            T[i][j] = std::min(std::min(T[i-1][j] + 1, T[i][j-1] + 1), T[i-1][j-1] + (x[i - 1] == y[j - 1] ? 0 : 1));
+    return T[m][n];
+}
+
+inline const long double findStringSimilarity(const std::string& first, const std::string& second) {
+    const long double maxL = std::max(first.length(), second.length());
+    return ((maxL > 0) ? ((maxL - getEditDistance(first, second)) / maxL) : 1);
+}
 
 class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
     public:
@@ -67,18 +87,20 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
                 m_dynSymTab.emplace_back(symbol.name);
         elf_close_object(&obj);
     }
-
+    
     DD_EXPORT void Unload(bool waitForAFullHalt = false) {
+        using namespace std;
+        using namespace this_thread;
         m_sem.notify();
         if(waitForAFullHalt) {
             m_sem.wait();
             // m_sem.waitFor([&](std::I64, std::I64){return !(this->m_isReloading); });
         }
         else {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            sleep_for(std::chrono::seconds(1));
         }
         {
-            std::ThreadLock lock(m_mtx);
+            lock_guard<mutex> lock(m_mtx);
             m_addressCache.clear();
         }
         CLOSE_LIB_BY_HANDLE(m_dll);
@@ -122,13 +144,14 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
     
     public:
     enum ReloadFlags : char {
-        COLD_RELOADABLE = BIT(0),
-        HOT_RELOADABLE = BIT(1)
+        COLD_RELOADABLE = 0,
+        HOT_RELOADABLE = 1
     };
     
     DD_EXPORT bool isSymAddressCached(const std::string key, bool blocking = true) {
+        using namespace std;
         if(blocking) {
-            std::ThreadLock lock(m_mtx);
+            lock_guard<mutex> lock(m_mtx);
             // BADLOGV(std::toString<bool>((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty()))
             return ((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty());
         } else {
@@ -159,16 +182,17 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
     private:
     DD_EXPORT ReloadFlags m_flags;
     DD_EXPORT void* GetSymAddress(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
+        using namespace std;
         if(!m_isInitLoaded) return 0;
-        m_sem.waitFor([&](std::I64, std::I64){return !(this->m_isReloading); });
-        std::ThreadLock lock(m_mtx);
+        m_sem.waitFor([&](int64_t, int64_t){return !(this->m_isReloading); });
+        lock_guard<mutex> lock(m_mtx);
         std::string lookupName;
         lookupName = needsDemangle ? std::move(abi::__cxa_demangle(symname.c_str(), NULL, NULL, NULL)) : symname;
         try {
             std::for_each(m_dynSymTab.begin(), m_dynSymTab.end(), [&](std::string& s) {
-                std::string cmp = cmpAsMangled ? s : std::move(abi::__cxa_demangle(s.c_str(), NULL, NULL, NULL));
+                const std::string cmp = (cmpAsMangled ? s : abi::__cxa_demangle(s.c_str(), NULL, NULL, NULL));
                 // BADLOG("cmp: " << cmp << std::endl << "lookupName: " << lookupName << std::endl << "actual sym: " << s << std::endl << "percent: " << std::findStringSimilarity(lookupName, cmp) * std::LD(100) << std::endl)
-                if(std::findStringSimilarity(lookupName, cmp) > 0.7) {
+                if(findStringSimilarity(lookupName, cmp) > 0.7) {
                     // BADLOGV(s);
                     lookupName = s;
                     throw std::exception();
@@ -179,7 +203,7 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
         if(!isSymAddressCached(lookupName, false)) {
             m_addressCache[lookupName] = (void*)GET_SYM_BY_STR(m_dll, lookupName.c_str());
         }
-        BADLOGV(m_addressCache[lookupName])
+        // BADLOGV(m_addressCache[lookupName])
         return m_addressCache[lookupName];
     }
     
