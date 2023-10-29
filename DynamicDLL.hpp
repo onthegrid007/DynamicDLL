@@ -1,15 +1,19 @@
+/*
+*   BSD 3-Clause License, see file labled 'LICENSE' for the full License.
+*   Copyright (c) 2023, Peter Ferranti
+*   All rights reserved.
+*/
+
 #ifndef DYNAMIC_DLL_
 #define DYNAMIC_DLL_
 
-#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/PlatformDetection/PlatformDetection.h"
-#include <vector>
-#include <thread>
-#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/semaphore.h"
+#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/semaphore.hpp"
 #include "vendor/FileUtilities/FileUtilities.hpp"
 #include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/vendor/Singleton/singleton_container_map.hpp"
 extern "C" {
     #include "vendor/libelfmaster/include/libelfmaster.h"
 }
+#include <thread>
 
 #if _BUILD_PLATFORM_WINDOWS
     #ifndef WIN32_LEAN_AND_MEAN
@@ -30,6 +34,7 @@ extern "C" {
 #else
     #include <link.h>
     #define DD_EXPORT __attribute__((visibility("default")))
+    #define DD_IMPORT
     typedef void* DLLModule;
     #define OPEN_LIB_INIT_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_GLOBAL : RTLD_GLOBAL)))
     #define OPEN_LIB_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_LOCAL : RTLD_LOCAL)))
@@ -59,21 +64,17 @@ inline const long double findStringSimilarity(const std::string& first, const st
 }
 
 class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
-    public:
-    typedef std::string SymNameType;
-    #define _DYNAMIC_DLL_FRIEND friend class DynaicDLL; friend class SingletonContainerMap<DynamicDLL>;
-    private:
-    DD_EXPORT DLLModule m_dll = 0;
-    DD_EXPORT Semaphore m_sem;
-    DD_EXPORT std::mutex m_mtx;
-    DD_EXPORT std::vector<SymNameType> m_dynSymTab;
-    DD_EXPORT std::unordered_map<SymNameType, void*> m_addressCache;
-    DD_EXPORT std::vector<FileUtilities::ParsedPath> m_libLoadNames;
-    DD_EXPORT std::vector<std::string> m_preLoadSymbols;
-    DD_EXPORT bool m_isInitLoaded = false;
-    DD_EXPORT bool m_isReloading = false;
+    private:    
+    DLLModule m_dll{0};
+    Semaphore m_sem{0};
+    std::mutex m_mtx;
+    std::vector<std::string> m_dynSymTab;
+    std::unordered_map<std::string, void*> m_addressCache;
+    std::vector<FileUtilities::ParsedPath> m_libLoadNames;
+    bool m_isInitLoaded{false};
+    bool m_isReloading{false};
     
-    DD_EXPORT void GenDynSymTab(const std::string& path) {
+    void GenDynSymTab(const std::string& path) {
         elfobj_t obj;
 	    elf_error_t error;
         elf_dynsym_iterator_t ds_iter;
@@ -88,13 +89,12 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
         elf_close_object(&obj);
     }
     
-    DD_EXPORT void Unload(bool waitForAFullHalt = false) {
+    void Unload(bool waitForAFullHalt = false) {
         using namespace std;
         using namespace this_thread;
-        m_sem.notify();
+        m_sem.spinAll();
         if(waitForAFullHalt) {
-            m_sem.wait();
-            // m_sem.waitFor([&](std::I64, std::I64){return !(this->m_isReloading); });
+            m_sem.waitForInit();
         }
         else {
             sleep_for(std::chrono::seconds(1));
@@ -107,35 +107,14 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
         m_dll = 0;
     }
     
-    DD_EXPORT void Preload() {
-        for(const auto& symname : m_preLoadSymbols) {
-            // to-do
-            // m_addressCache[symname] = (void*)GET_SYM_BY_STR(m_dll, symname.c_str());
-        }
-        m_isInitLoaded = true;
-    }
-    
-    DD_EXPORT bool Load(bool initLoad = false) {
-        if(initLoad) {
-            for(auto& lib : m_libLoadNames) {
-                std::string currentLib = lib;
+    const bool Load() {
+        for(auto& lib : m_libLoadNames) {
+            const std::string currentLib = lib;
+            m_dll = (m_isInitLoaded ? OPEN_LIB_INIT_BY_CSTR(currentLib.c_str()) : OPEN_LIB_BY_CSTR(currentLib.c_str()));
+            if(m_dll) {
                 GenDynSymTab(currentLib);
-                m_dll = OPEN_LIB_INIT_BY_CSTR(currentLib.c_str());
-                if(m_dll) {
-                    Preload();
-                    return true;
-                }
-            }
-        }
-        else {
-            for(auto& lib : m_libLoadNames) {
-                std::string currentLib = lib;
-                GenDynSymTab(currentLib);
-                m_dll = OPEN_LIB_BY_CSTR(currentLib.c_str());
-                if(m_dll) {
-                    Preload();
-                    return true;
-                }
+                m_isInitLoaded = true;
+                return true;
             }
         }
         m_dll = 0;
@@ -143,80 +122,75 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
     }
     
     public:
-    enum ReloadFlags : char {
+    enum ReloadFlags : std::uint8_t {
         COLD_RELOADABLE = 0,
         HOT_RELOADABLE = 1
     };
     
-    DD_EXPORT bool isSymAddressCached(const std::string key, bool blocking = true) {
+    template<bool blocking = true>
+    bool isSymAddressCached(const std::string key) {
         using namespace std;
-        if(blocking) {
+        if constexpr(blocking) {
             lock_guard<mutex> lock(m_mtx);
-            // BADLOGV(std::toString<bool>((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty()))
             return ((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty());
         } else {
-            // BADLOGV(std::toString<bool>((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty()))
             return ((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty());
         }
     }
     
-    DD_EXPORT void Reload(bool waitForAFullHalt = false) {
-        if(!m_isInitLoaded) return;
+    void Reload(bool waitForAFullHalt = false) {
+        if(!m_isInitLoaded || m_isReloading) return;
         m_isReloading = true;
         Unload(waitForAFullHalt);
-        Load(false);
+        Load();
         m_isReloading = false;
-        m_sem.notify();
+        m_sem.spinAll();
     }
  
     template<typename T, typename ... Args>
-    DD_EXPORT auto& CallSym(T* _T, const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false, Args... args) {
+    auto& CallSym(T* _T, const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false, Args... args) {
         return (*(T*)GetSymAddress(symname, needsDemangle, cmpAsMangled))(args...);
     }
     
     template<typename T>
-    DD_EXPORT T& GetSymAs(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
+    T& GetSym(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
         return *((T*)GetSymAddress(symname, needsDemangle, cmpAsMangled));
     }
     
     private:
-    DD_EXPORT ReloadFlags m_flags;
-    DD_EXPORT void* GetSymAddress(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
+    _SCM_CHILD_DECLORATIONS(DynamicDLL)
+    ReloadFlags m_flags;
+    void* GetSymAddress(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
         using namespace std;
         if(!m_isInitLoaded) return 0;
         m_sem.waitFor([&](int64_t, int64_t){return !(this->m_isReloading); });
         lock_guard<mutex> lock(m_mtx);
-        std::string lookupName;
-        lookupName = needsDemangle ? std::move(abi::__cxa_demangle(symname.c_str(), NULL, NULL, NULL)) : symname;
+        std::string lookupName{needsDemangle ? std::move(abi::__cxa_demangle(symname.c_str(), NULL, NULL, NULL)) : symname};
         try {
-            std::for_each(m_dynSymTab.begin(), m_dynSymTab.end(), [&](std::string& s) {
+            std::for_each(m_dynSymTab.begin(), m_dynSymTab.end(), [&](const std::string& s) {
                 const std::string cmp = (cmpAsMangled ? s : abi::__cxa_demangle(s.c_str(), NULL, NULL, NULL));
-                // BADLOG("cmp: " << cmp << std::endl << "lookupName: " << lookupName << std::endl << "actual sym: " << s << std::endl << "percent: " << std::findStringSimilarity(lookupName, cmp) * std::LD(100) << std::endl)
-                if(findStringSimilarity(lookupName, cmp) > 0.7) {
-                    // BADLOGV(s);
+               if(findStringSimilarity(lookupName, cmp) > 0.7) {
                     lookupName = s;
                     throw std::exception();
                 }
             });
         }
         catch(std::exception& e) {}
-        if(!isSymAddressCached(lookupName, false)) {
+        if(!isSymAddressCached<false>(lookupName)) {
             m_addressCache[lookupName] = (void*)GET_SYM_BY_STR(m_dll, lookupName.c_str());
         }
-        // BADLOGV(m_addressCache[lookupName])
         return m_addressCache[lookupName];
     }
     
-    _SCM_CHILD_DECLORATIONS(DynamicDLL)
-    DD_EXPORT DynamicDLL(std::vector<FileUtilities::ParsedPath> libloadnames, std::vector<std::string> preloadsymbols, ReloadFlags flags = ReloadFlags::COLD_RELOADABLE) :
+    DynamicDLL(std::vector<FileUtilities::ParsedPath> libloadnames, ReloadFlags flags = ReloadFlags::COLD_RELOADABLE) :
         m_libLoadNames(libloadnames),
-        m_preLoadSymbols(preloadsymbols),
         m_flags(flags) {
-        if(!Load(true))
+        if(!Load())
             std::cout << m_libLoadNames[0].getPath(FileUtilities::PathType::NameOnly) << ": DynamicDLL Load Failed!" << std::endl;
     }
-    DD_EXPORT ~DynamicDLL() {}
+    ~DynamicDLL() {}
 };
+
 _SCM_CHILD_DEFINITIONS(DynamicDLL)
 
 #endif
