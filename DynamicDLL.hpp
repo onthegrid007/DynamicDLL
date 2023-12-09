@@ -8,8 +8,8 @@
 #define DYNAMIC_DLL_
 
 #include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/semaphore.hpp"
+#include "vendor/FileUtilities/vendor/STDExtras/STDExtras.hpp"
 #include "vendor/FileUtilities/FileUtilities.hpp"
-#include "vendor/FileUtilities/vendor/STDExtras/vendor/ThreadPool/vendor/Semaphore/vendor/Singleton/singleton_container_map.hpp"
 extern "C" {
     #include "vendor/libelfmaster/include/libelfmaster.h"
 }
@@ -36,8 +36,8 @@ extern "C" {
     #define DD_EXPORT __attribute__((visibility("default")))
     #define DD_IMPORT
     typedef void* DLLModule;
-    #define OPEN_LIB_INIT_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_GLOBAL : RTLD_GLOBAL)))
-    #define OPEN_LIB_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlags::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_LOCAL : RTLD_LOCAL)))
+    #define OPEN_LIB_INIT_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlag::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_GLOBAL : RTLD_GLOBAL)))
+    #define OPEN_LIB_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_DEEPBIND | (((m_flags & ReloadFlag::HOT_RELOADABLE) ? RTLD_NODELETE | RTLD_LOCAL : RTLD_LOCAL)))
     // #define OPEN_LIB_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_NODELETE | RTLD_GLOBAL)
     // #define OPEN_LIB_COLD_BY_CSTR(str) dlopen(str, RTLD_NOW | RTLD_GLOBAL)
     #define GET_SYM_BY_STR(handle, str) dlsym(handle, str)
@@ -63,7 +63,13 @@ inline const long double findStringSimilarity(const std::string& first, const st
     return ((maxL > 0) ? ((maxL - getEditDistance(first, second)) / maxL) : 1);
 }
 
-class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
+class DynamicDLL {
+     public:
+    enum ReloadFlag : bool {
+        COLD_RELOADABLE = false,
+        HOT_RELOADABLE = true
+    };
+    
     private:    
     DLLModule m_dll{0};
     Semaphore m_sem{0};
@@ -73,6 +79,9 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
     std::vector<FileUtilities::ParsedPath> m_libLoadNames;
     bool m_isInitLoaded{false};
     bool m_isReloading{false};
+    ReloadFlag m_flags;
+    inline static std::unordered_map<std::string, DynamicDLL*> _Instances{};
+    inline static std::mutex _SMTX{};
     
     void GenDynSymTab(const std::string& path) {
         elfobj_t obj;
@@ -109,7 +118,7 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
     
     const bool Load() {
         for(auto& lib : m_libLoadNames) {
-            const std::string currentLib = lib;
+            const std::string currentLib{lib};
             m_dll = (m_isInitLoaded ? OPEN_LIB_INIT_BY_CSTR(currentLib.c_str()) : OPEN_LIB_BY_CSTR(currentLib.c_str()));
             if(m_dll) {
                 GenDynSymTab(currentLib);
@@ -121,21 +130,8 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
         return false;
     }
     
-    public:
-    enum ReloadFlags : std::uint8_t {
-        COLD_RELOADABLE = 0,
-        HOT_RELOADABLE = 1
-    };
-    
-    template<bool blocking = true>
     bool isSymAddressCached(const std::string key) {
-        using namespace std;
-        if constexpr(blocking) {
-            lock_guard<mutex> lock(m_mtx);
-            return ((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty());
-        } else {
-            return ((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty());
-        }
+        return ((m_addressCache.find(key) != m_addressCache.end()) && !m_addressCache.empty());
     }
     
     void Reload(bool waitForAFullHalt = false) {
@@ -146,20 +142,7 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
         m_isReloading = false;
         m_sem.spinAll();
     }
- 
-    template<typename T, typename ... Args>
-    auto& CallSym(T* _T, const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false, Args... args) {
-        return (*(T*)GetSymAddress(symname, needsDemangle, cmpAsMangled))(args...);
-    }
     
-    template<typename T>
-    T& GetSym(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
-        return *((T*)GetSymAddress(symname, needsDemangle, cmpAsMangled));
-    }
-    
-    private:
-    _SCM_CHILD_DECLORATIONS(DynamicDLL)
-    ReloadFlags m_flags;
     void* GetSymAddress(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
         using namespace std;
         if(!m_isInitLoaded) return 0;
@@ -171,26 +154,56 @@ class DynamicDLL : public SingletonContainerMap<DynamicDLL> {
                 const std::string cmp = (cmpAsMangled ? s : abi::__cxa_demangle(s.c_str(), NULL, NULL, NULL));
                if(findStringSimilarity(lookupName, cmp) > 0.7) {
                     lookupName = s;
-                    throw std::exception();
+                    throw;
                 }
             });
         }
-        catch(std::exception& e) {}
-        if(!isSymAddressCached<false>(lookupName)) {
+        catch(...) {}
+        if(!isSymAddressCached(lookupName)) {
             m_addressCache[lookupName] = (void*)GET_SYM_BY_STR(m_dll, lookupName.c_str());
         }
         return m_addressCache[lookupName];
     }
     
-    DynamicDLL(std::vector<FileUtilities::ParsedPath> libloadnames, ReloadFlags flags = ReloadFlags::COLD_RELOADABLE) :
+    DynamicDLL(std::vector<FileUtilities::ParsedPath> libloadnames, ReloadFlag flags) :
         m_libLoadNames(libloadnames),
         m_flags(flags) {
         if(!Load())
             std::cout << m_libLoadNames[0].getPath(FileUtilities::PathType::NameOnly) << ": DynamicDLL Load Failed!" << std::endl;
     }
+    
+    DynamicDLL() {}
     ~DynamicDLL() {}
+    
+    public:
+    static const bool InstanceExists(const std::string key) {
+        return ((_Instances.find(key) != _Instances.end()) && !_Instances.empty());
+    }
+    
+    static DynamicDLL& BeginInstance(const std::string key, std::vector<FileUtilities::ParsedPath> libloadnames, ReloadFlag flags = ReloadFlag::COLD_RELOADABLE) {
+        std::ThreadLock lock(_SMTX);
+        if(InstanceExists(key))
+            return *(_Instances[key]);
+        std::cout << "here" << std::endl;
+        return *(_Instances[key] = std::move(new DynamicDLL(libloadnames, flags)));
+    }
+    
+    static DynamicDLL& GetInstance(const std::string key) {
+        if(InstanceExists(key))
+            return *(_Instances[key]);
+        return *(_Instances[key] = std::move(new DynamicDLL()));
+    }    
+    
+    template<typename T, typename ... Args>
+    std::invoke_result_t<T, Args...> CallSym(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false, Args... args) {
+        return (*(T*)GetSymAddress(symname, needsDemangle, cmpAsMangled))(args...);
+    }
+    
+    template<typename T>
+    T& GetSym(const std::string symname, bool needsDemangle = false,  bool cmpAsMangled = false) {
+        return *((T*)GetSymAddress(symname, needsDemangle, cmpAsMangled));
+    }
 };
 
-_SCM_CHILD_DEFINITIONS(DynamicDLL)
 
 #endif
